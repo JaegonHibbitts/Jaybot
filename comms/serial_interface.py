@@ -11,15 +11,15 @@
 
 """JayBot Raspberry Pi serial interface.
 
-Command frame sent to Arduino:
+Command sent to the Arduino:
     @sequence,leftRPMx10,rightRPMx10,leftSteeringx10,rightSteeringx10*CRC\n
 
-Telemetry frame received from Arduino:
+Telemetry received from the Arduino:
     !sequence,leftMeasuredRPMx10,rightMeasuredRPMx10,leftSignedPWM,
       rightSignedPWM,leftTicks,rightTicks,status*CRC\n
 
-The sequence number is only an acknowledgment/correlation value. It is not a
-motion mode and it does not cause a maneuver on the Arduino.
+The Arduino receives only two RPM targets and two steering targets. The
+sequence number is an acknowledgement/correlation value, not a motion mode.
 """
 
 from __future__ import annotations
@@ -32,9 +32,20 @@ from typing import Optional
 import serial
 
 
+LEFT_STRAIGHT_ANGLE_DEG = 136.0
+RIGHT_STRAIGHT_ANGLE_DEG = 39.0
+
 STATUS_COMMS_TIMEOUT = 1 << 0
 STATUS_BAD_PACKET = 1 << 1
 STATUS_RX_OVERFLOW = 1 << 2
+
+
+@dataclass(frozen=True)
+class DriveSetpoint:
+    left_rpm: float
+    right_rpm: float
+    left_steering_deg: float
+    right_steering_deg: float
 
 
 @dataclass(frozen=True)
@@ -52,9 +63,17 @@ class Telemetry:
     def communication_timed_out(self) -> bool:
         return bool(self.status & STATUS_COMMS_TIMEOUT)
 
+    @property
+    def bad_packet_seen(self) -> bool:
+        return bool(self.status & STATUS_BAD_PACKET)
+
+    @property
+    def receive_overflow_seen(self) -> bool:
+        return bool(self.status & STATUS_RX_OVERFLOW)
+
 
 def crc8_atm(payload: bytes) -> int:
-    """CRC-8/ATM, polynomial 0x07, initial value 0x00."""
+    """Return CRC-8/ATM: polynomial 0x07, initial value 0x00."""
     crc = 0x00
 
     for byte in payload:
@@ -69,7 +88,7 @@ def crc8_atm(payload: bytes) -> int:
 
 
 class JaybotSerialInterface:
-    """Nonblocking setpoint sender and telemetry receiver."""
+    """Send drive/steering setpoints and optionally read debug telemetry."""
 
     def __init__(
         self,
@@ -87,6 +106,17 @@ class JaybotSerialInterface:
         self._receive_buffer = bytearray()
         self._receiving_telemetry = False
 
+        self._last_setpoint = DriveSetpoint(
+            left_rpm=0.0,
+            right_rpm=0.0,
+            left_steering_deg=LEFT_STRAIGHT_ANGLE_DEG,
+            right_steering_deg=RIGHT_STRAIGHT_ANGLE_DEG,
+        )
+
+    @property
+    def last_setpoint(self) -> DriveSetpoint:
+        return self._last_setpoint
+
     def close(self) -> None:
         self._serial.close()
 
@@ -94,11 +124,11 @@ class JaybotSerialInterface:
         return self
 
     def __exit__(self, *_: object) -> None:
-        # Send several neutral commands before closing so one has a strong
-        # chance of being accepted before the USB port disappears.
+        # Send several neutral commands before closing. The Arduino watchdog
+        # remains the final protection if the port disappears unexpectedly.
         for _ in range(3):
             try:
-                self.send_drive_command(0.0, 0.0, 90.0, 90.0)
+                self.send_neutral()
                 time.sleep(0.02)
             except (serial.SerialException, serial.SerialTimeoutException):
                 break
@@ -114,6 +144,15 @@ class JaybotSerialInterface:
             raise ValueError("Command values must be finite.")
         return int(round(value * 10.0))
 
+    def send_neutral(self) -> int:
+        """Stop both motors and center both steering servos."""
+        return self.send_drive_command(
+            left_rpm=0.0,
+            right_rpm=0.0,
+            left_steering_deg=LEFT_STRAIGHT_ANGLE_DEG,
+            right_steering_deg=RIGHT_STRAIGHT_ANGLE_DEG,
+        )
+
     def send_drive_command(
         self,
         left_rpm: float,
@@ -123,17 +162,23 @@ class JaybotSerialInterface:
     ) -> int:
         """Send one complete drive-and-steering setpoint.
 
-        Call this at approximately 20 Hz. Sending zero RPM and neutral steering
-        is the normal stop command; there is no separate mode field.
+        Normal operation should call this approximately 20 times per second.
+        Zero RPM with straight steering is the neutral/stop command.
         """
-        sequence = self._next_sequence()
+        setpoint = DriveSetpoint(
+            left_rpm=left_rpm,
+            right_rpm=right_rpm,
+            left_steering_deg=left_steering_deg,
+            right_steering_deg=right_steering_deg,
+        )
 
+        sequence = self._next_sequence()
         fields = (
             sequence,
-            self._to_x10(left_rpm),
-            self._to_x10(right_rpm),
-            self._to_x10(left_steering_deg),
-            self._to_x10(right_steering_deg),
+            self._to_x10(setpoint.left_rpm),
+            self._to_x10(setpoint.right_rpm),
+            self._to_x10(setpoint.left_steering_deg),
+            self._to_x10(setpoint.right_steering_deg),
         )
 
         if not (-3500 <= fields[1] <= 3500):
@@ -152,13 +197,99 @@ class JaybotSerialInterface:
         frame = f"@{payload_text}*{checksum:02X}\n".encode("ascii")
         self._serial.write(frame)
 
+        # Update only after the complete frame has been handed to pySerial.
+        self._last_setpoint = setpoint
         return sequence
 
-    def read_latest_telemetry(self) -> Optional[Telemetry]:
-        """Drain available bytes and return the newest valid telemetry frame."""
-        newest: Optional[Telemetry] = None
+    def corrective_reverse(
+        self,
+        duration_seconds: float = 1.0,
+        speed_fraction: float = 0.5,
+        reference_rpm: Optional[float] = None,
+        command_rate_hz: float = 20.0,
+        restore_previous: bool = True,
+    ) -> None:
+        """Reverse straight for a fixed time using ordinary serial commands.
 
+        The previous drive/steering setpoint is saved. During the correction,
+        equal negative RPM targets and the calibrated straight steering angles
+        are transmitted at `command_rate_hz`. The previous setpoint is then
+        restored.
+
+        Telemetry is not used to start, stop, or complete this action.
+
+        `reference_rpm` may be supplied explicitly. Otherwise the function uses
+        the greater magnitude of the currently commanded left/right RPM.
+        """
+        if duration_seconds <= 0.0:
+            raise ValueError("duration_seconds must be greater than zero.")
+        if not (0.0 < speed_fraction <= 1.0):
+            raise ValueError("speed_fraction must be in the range (0, 1].")
+        if command_rate_hz <= 0.0:
+            raise ValueError("command_rate_hz must be greater than zero.")
+
+        previous = self._last_setpoint
+
+        if reference_rpm is None:
+            reference_speed = max(
+                abs(previous.left_rpm),
+                abs(previous.right_rpm),
+            )
+        else:
+            reference_speed = abs(reference_rpm)
+
+        if reference_speed < 0.5:
+            raise ValueError(
+                "No usable reference RPM is available. Supply reference_rpm "
+                "or call corrective_reverse while a nonzero command is active."
+            )
+
+        reverse_rpm = -reference_speed * speed_fraction
+        period_seconds = 1.0 / command_rate_hz
+        finish_time = time.monotonic() + duration_seconds
+        next_send_time = time.monotonic()
+
+        try:
+            while True:
+                now = time.monotonic()
+                if now >= finish_time:
+                    break
+
+                self.send_drive_command(
+                    left_rpm=reverse_rpm,
+                    right_rpm=reverse_rpm,
+                    left_steering_deg=LEFT_STRAIGHT_ANGLE_DEG,
+                    right_steering_deg=RIGHT_STRAIGHT_ANGLE_DEG,
+                )
+
+                next_send_time += period_seconds
+                sleep_duration = min(
+                    next_send_time,
+                    finish_time,
+                ) - time.monotonic()
+
+                if sleep_duration > 0.0:
+                    time.sleep(sleep_duration)
+        finally:
+            if restore_previous:
+                self.send_drive_command(
+                    left_rpm=previous.left_rpm,
+                    right_rpm=previous.right_rpm,
+                    left_steering_deg=previous.left_steering_deg,
+                    right_steering_deg=previous.right_steering_deg,
+                )
+            else:
+                self.send_neutral()
+
+    def read_latest_telemetry(self) -> Optional[Telemetry]:
+        """Return the newest valid telemetry frame currently available.
+
+        Telemetry is optional and intended for debugging/logging. It does not
+        control the timed corrective reverse.
+        """
+        newest: Optional[Telemetry] = None
         waiting = self._serial.in_waiting
+
         if waiting <= 0:
             return None
 
@@ -231,43 +362,3 @@ class JaybotSerialInterface:
             right_ticks=fields[6],
             status=fields[7],
         )
-
-
-@dataclass
-class EncoderDistanceTracker:
-    """Pi-owned helper for a later fixed-distance corrective maneuver.
-
-    This helper does not create an Arduino motion mode. The higher-order Pi
-    controller repeatedly sends the desired signed RPM, checks telemetry, and
-    sends zero RPM once the target encoder distance is reached.
-    """
-
-    counts_per_revolution: float = 660.0
-    wheel_diameter_mm: float = 65.0
-    start_left_ticks: Optional[int] = None
-    start_right_ticks: Optional[int] = None
-    target_counts: float = 0.0
-
-    def start(self, distance_mm: float, telemetry: Telemetry) -> None:
-        if distance_mm <= 0:
-            raise ValueError("Distance must be greater than zero.")
-
-        circumference_mm = math.pi * self.wheel_diameter_mm
-        self.target_counts = (
-            distance_mm / circumference_mm
-        ) * self.counts_per_revolution
-
-        self.start_left_ticks = telemetry.left_ticks
-        self.start_right_ticks = telemetry.right_ticks
-
-    def progress_counts(self, telemetry: Telemetry) -> float:
-        if self.start_left_ticks is None or self.start_right_ticks is None:
-            raise RuntimeError("Distance tracking has not been started.")
-
-        left_delta = abs(telemetry.left_ticks - self.start_left_ticks)
-        right_delta = abs(telemetry.right_ticks - self.start_right_ticks)
-
-        return (left_delta + right_delta) / 2.0
-
-    def complete(self, telemetry: Telemetry) -> bool:
-        return self.progress_counts(telemetry) >= self.target_counts

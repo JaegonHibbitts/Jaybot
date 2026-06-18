@@ -30,11 +30,11 @@ constexpr uint8_t LEFT_ENC_B  = 3;
 // Standard Servo on an Uno uses Timer1, so motor PWM remains on 5/6.
 // Power the steering servos from a suitable external supply and share GND.
 // ============================================================
-constexpr uint8_t LEFT_STEER_PIN  = 9;
+constexpr uint8_t LEFT_STEER_PIN  = 11;
 constexpr uint8_t RIGHT_STEER_PIN = 10;
 
-constexpr int16_t LEFT_STEER_NEUTRAL_X10  = 900;  // 90.0 degrees
-constexpr int16_t RIGHT_STEER_NEUTRAL_X10 = 900;  // 90.0 degrees
+constexpr int16_t LEFT_STEER_NEUTRAL_X10  = 1360;
+constexpr int16_t RIGHT_STEER_NEUTRAL_X10 = 390;  
 
 constexpr int16_t STEER_MIN_X10 = 0;
 constexpr int16_t STEER_MAX_X10 = 1800;
